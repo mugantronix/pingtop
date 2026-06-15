@@ -89,7 +89,7 @@ func TestFormatSentLost(t *testing.T) {
 }
 
 func TestBuildRowsInitial(t *testing.T) {
-	rows := buildRows([]string{"1.1.1.1", "8.8.8.8"}, nil, nil, styler{})
+	rows := buildRows([]string{"1.1.1.1", "8.8.8.8"}, nil, nil, styler{}, sparkWidth)
 	if len(rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(rows))
 	}
@@ -262,7 +262,7 @@ func TestFilterCaseInsensitive(t *testing.T) {
 }
 
 func TestFormatSparkEmpty(t *testing.T) {
-	got := formatSpark(nil)
+	got := formatSpark(nil, sparkWidth)
 	if got != strings.Repeat(" ", sparkWidth) {
 		t.Errorf("empty history should render as %d spaces, got %q", sparkWidth, got)
 	}
@@ -270,7 +270,7 @@ func TestFormatSparkEmpty(t *testing.T) {
 
 func TestFormatSparkAllEqual(t *testing.T) {
 	h := []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}
-	got := formatSpark(h)
+	got := formatSpark(h, sparkWidth)
 	mid := string(sparkBars[len(sparkBars)/2])
 	// Three middle bars, padded on the left to sparkWidth.
 	want := strings.Repeat(" ", sparkWidth-3) + strings.Repeat(mid, 3)
@@ -281,7 +281,7 @@ func TestFormatSparkAllEqual(t *testing.T) {
 
 func TestFormatSparkScalesMinMax(t *testing.T) {
 	h := []time.Duration{1 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
-	got := formatSpark(h)
+	got := formatSpark(h, sparkWidth)
 	runes := []rune(got)
 	// Last three runes are the data; min should be first bar, max should be last bar.
 	last3 := runes[len(runes)-3:]
@@ -293,18 +293,58 @@ func TestFormatSparkScalesMinMax(t *testing.T) {
 	}
 }
 
+func TestFormatSparkRespectsWidth(t *testing.T) {
+	got := formatSpark(nil, 50)
+	if got != strings.Repeat(" ", 50) {
+		t.Errorf("empty history at width=50 should render as 50 spaces, got %d chars", len([]rune(got)))
+	}
+}
+
 func TestAppendHistoryRingBuffer(t *testing.T) {
 	h := make(map[string][]time.Duration)
-	for i := 0; i < sparkWidth+5; i++ {
+	for i := 0; i < maxSparkWidth+5; i++ {
 		appendHistory(h, "x", time.Duration(i)*time.Millisecond)
 	}
-	if len(h["x"]) != sparkWidth {
-		t.Errorf("history should cap at %d samples, got %d", sparkWidth, len(h["x"]))
+	if len(h["x"]) != maxSparkWidth {
+		t.Errorf("history should cap at %d samples, got %d", maxSparkWidth, len(h["x"]))
 	}
 	// The oldest 5 samples should have been evicted; the buffer's first
 	// sample should be sample #5 (zero-indexed).
 	if h["x"][0] != 5*time.Millisecond {
 		t.Errorf("oldest sample should be 5ms, got %v", h["x"][0])
+	}
+}
+
+func TestEffectiveSparkWidthClaimsSlack(t *testing.T) {
+	// All 9 columns visible total to 28+10+10+10+10+10+8+12+(20+2)=120.
+	// At termWidth=160 there are 40 chars of slack — spark should claim it.
+	got := effectiveSparkWidth(160)
+	want := sparkWidth + (160 - 120)
+	if got != want {
+		t.Errorf("at termWidth=160 spark should be %d, got %d", want, got)
+	}
+}
+
+func TestEffectiveSparkWidthCapped(t *testing.T) {
+	got := effectiveSparkWidth(10_000)
+	if got != maxSparkWidth {
+		t.Errorf("very wide terminal should cap spark at %d, got %d", maxSparkWidth, got)
+	}
+}
+
+func TestEffectiveSparkWidthDefaultWhenNoSlack(t *testing.T) {
+	// At termWidth=120 the columns exactly fill: no slack.
+	got := effectiveSparkWidth(120)
+	if got != sparkWidth {
+		t.Errorf("at termWidth=120 (exact fit) spark should be default %d, got %d", sparkWidth, got)
+	}
+}
+
+func TestEffectiveSparkWidthDefaultWhenSparkHidden(t *testing.T) {
+	// At termWidth=70 the SPARK column gets hidden by the tier algorithm.
+	got := effectiveSparkWidth(70)
+	if got != sparkWidth {
+		t.Errorf("when SPARK is hidden spark should fall back to default %d, got %d", sparkWidth, got)
 	}
 }
 

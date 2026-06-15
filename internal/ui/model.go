@@ -232,7 +232,8 @@ func (m Model) View() string {
 // current model state rather than holding a long-lived table instance.
 func (m Model) renderTable() string {
 	visible := visibleColumns(m.termWidth)
-	fullRows := buildRows(m.visibleIDs(), m.stats, m.history, m.styler)
+	sparkW := effectiveSparkWidth(m.termWidth)
+	fullRows := buildRows(m.visibleIDs(), m.stats, m.history, m.styler, sparkW)
 
 	headers := make([]string, len(visible))
 	for i, ci := range visible {
@@ -271,9 +272,13 @@ func (m Model) renderTable() string {
 		Rows(rows...).
 		StyleFunc(func(row, col int) lipgloss.Style {
 			origCol := visible[col]
+			w := columns[origCol].width
+			if origCol == len(columns)-1 {
+				w = sparkW + 2
+			}
 			s := lipgloss.NewStyle().
-				Width(columns[origCol].width).
-				MaxWidth(columns[origCol].width).
+				Width(w).
+				MaxWidth(w).
 				PaddingRight(1)
 			if row == table.HeaderRow {
 				s = s.Bold(true)
@@ -360,13 +365,14 @@ func (m Model) visibleIDs() []string {
 }
 
 // buildRows produces table rows in the stable order. A nil stats map
-// renders all targets in their initial "no data yet" state.
-func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[string][]time.Duration, st styler) [][]string {
+// renders all targets in their initial "no data yet" state. sparkW is
+// the rendered sparkline width (see effectiveSparkWidth).
+func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[string][]time.Duration, st styler, sparkW int) [][]string {
 	rows := make([][]string, len(order))
 	for i, id := range order {
 		s, ok := stats[id]
 		if !ok {
-			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", formatSpark(nil)}
+			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", formatSpark(nil, sparkW)}
 			continue
 		}
 		rows[i] = []string{
@@ -378,7 +384,7 @@ func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[
 			st.render(formatJitter(s), jitterLevel(s)),
 			st.render(formatLoss(s), lossLevel(s)),
 			formatSentLost(s),
-			formatSpark(history[id]),
+			formatSpark(history[id], sparkW),
 		}
 	}
 	return rows
@@ -702,16 +708,19 @@ func removeID(order []string, id string) []string {
 	return order
 }
 
-// sparkWidth is the number of recent RTT samples shown in the SPARK
-// column. At a 1 s interval this is also the seconds of visible history.
+// sparkWidth is the default number of recent RTT samples shown in the
+// SPARK column. At a 1 s interval this is also the seconds of visible
+// history. On wide terminals the column expands up to maxSparkWidth to
+// claim leftover horizontal space.
 const sparkWidth = 20
+const maxSparkWidth = 200
 
 // sparkBars is the 8-level Unicode bar set used to render samples.
 var sparkBars = []rune("▁▂▃▄▅▆▇█")
 
 func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
 	buf := h[id]
-	if len(buf) >= sparkWidth {
+	if len(buf) >= maxSparkWidth {
 		buf = buf[1:]
 	}
 	h[id] = append(buf, rtt)
@@ -720,10 +729,17 @@ func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
 // formatSpark renders the recent RTT samples as a Unicode bar chart,
 // scaled per-target between the window's min and max so relative
 // jitter is what's visible. Pads with leading spaces until the buffer
-// fills, so the latest sample is always at the right edge.
-func formatSpark(history []time.Duration) string {
+// fills, so the latest sample is always at the right edge. width sets
+// the rendered column width (number of bar cells).
+func formatSpark(history []time.Duration, width int) string {
+	if width <= 0 {
+		width = sparkWidth
+	}
 	if len(history) == 0 {
-		return strings.Repeat(" ", sparkWidth)
+		return strings.Repeat(" ", width)
+	}
+	if len(history) > width {
+		history = history[len(history)-width:]
 	}
 	min, max := history[0], history[0]
 	for _, d := range history[1:] {
@@ -737,8 +753,8 @@ func formatSpark(history []time.Duration) string {
 	rng := max - min
 
 	var b strings.Builder
-	b.Grow(sparkWidth * 4) // bars are 3-byte UTF-8 runes
-	for i := 0; i < sparkWidth-len(history); i++ {
+	b.Grow(width * 4) // bars are 3-byte UTF-8 runes
+	for i := 0; i < width-len(history); i++ {
 		b.WriteByte(' ')
 	}
 	for _, d := range history {
@@ -755,4 +771,37 @@ func formatSpark(history []time.Duration) string {
 		b.WriteRune(sparkBars[idx])
 	}
 	return b.String()
+}
+
+// effectiveSparkWidth returns how many sparkline bars the SPARK column
+// should render given the current terminal width. It claims any
+// horizontal slack left over after the visible columns lay out, capped
+// at maxSparkWidth. Returns sparkWidth (the default) when SPARK isn't
+// visible or termWidth hasn't been received yet.
+func effectiveSparkWidth(termWidth int) int {
+	if termWidth <= 0 {
+		return sparkWidth
+	}
+	sparkIdx := len(columns) - 1
+	visible := visibleColumns(termWidth)
+	sparkOn := false
+	used := 0
+	for _, ci := range visible {
+		used += columns[ci].width
+		if ci == sparkIdx {
+			sparkOn = true
+		}
+	}
+	if !sparkOn {
+		return sparkWidth
+	}
+	slack := termWidth - used
+	if slack <= 0 {
+		return sparkWidth
+	}
+	w := sparkWidth + slack
+	if w > maxSparkWidth {
+		return maxSparkWidth
+	}
+	return w
 }
