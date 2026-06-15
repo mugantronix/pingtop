@@ -249,8 +249,20 @@ func (m Model) renderTable() string {
 			}
 		}
 	}
-	rows := make([][]string, len(fullRows))
-	for r, row := range fullRows {
+	// Slice the visible window ourselves rather than handing all rows to
+	// lipgloss/table with Height()+Offset(). The library reserves the
+	// bottom line for an ellipsis when there's overflow, which silently
+	// hides the last data row even at maxOffset — on a /24 that's the
+	// last two hosts you can never scroll to. By pre-trimming to the
+	// window the table never enters overflow mode and every row stays
+	// reachable.
+	avail := m.visibleRowCount(len(fullRows))
+	windowed := fullRows
+	if avail < len(fullRows) {
+		windowed = fullRows[m.offset : m.offset+avail]
+	}
+	rows := make([][]string, len(windowed))
+	for r, row := range windowed {
 		cells := make([]string, len(visible))
 		for i, ci := range visible {
 			cells[i] = row[ci]
@@ -285,14 +297,24 @@ func (m Model) renderTable() string {
 			}
 			return s
 		})
-	// Height() enables lipgloss/table's offset-based scroll. Without it
-	// the table tries to render every row, which overflows the terminal
-	// on large CIDR scans.
-	if m.termHeight > 0 {
-		// Reserve one line for the help text below the table.
-		t = t.Height(m.termHeight - 1)
+	return t.String()
+}
+
+// visibleRowCount is how many data rows fit in the table area.
+// Returns total when the terminal height isn't known yet so the first
+// frame isn't truncated.
+func (m Model) visibleRowCount(total int) int {
+	if m.termHeight <= 0 {
+		return total
 	}
-	return t.Offset(m.offset).String()
+	avail := m.termHeight - 1 - headerLines
+	if avail < 1 {
+		avail = 1
+	}
+	if avail > total {
+		return total
+	}
+	return avail
 }
 
 // visibleIDs returns m.order filtered by m.filter (case-insensitive

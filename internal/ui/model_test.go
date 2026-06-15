@@ -109,6 +109,25 @@ func TestBuildRowsInitial(t *testing.T) {
 	}
 }
 
+func TestRenderTableShowsLastRowsAtMaxOffset(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	m := New(ids, updates, false, false)
+	m.termWidth = 200    // wide enough for all columns
+	m.termHeight = 6     // 1 help + 2 header = 3 data rows visible
+	m.offset = m.maxOffset()
+
+	out := m.renderTable()
+	// At maxOffset the last visible chunk must include "h" — the regression
+	// was that lipgloss/table's overflow ellipsis swallowed the bottom row.
+	if !strings.Contains(out, "h") {
+		t.Errorf("expected last row 'h' visible at maxOffset, got:\n%s", out)
+	}
+	if !strings.Contains(out, "g") {
+		t.Errorf("expected penultimate row 'g' visible at maxOffset, got:\n%s", out)
+	}
+}
+
 func TestScrollWithinBounds(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	m := New([]string{"a", "b", "c", "d", "e"}, updates, false, false)
