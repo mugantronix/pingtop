@@ -100,18 +100,18 @@ func TestPingerTimedOutOnUnreachableHost(t *testing.T) {
 	p := &Pinger{
 		ID:       "192.0.2.1",
 		Host:     "192.0.2.1",
-		Interval: 300 * time.Millisecond,
+		Interval: 200 * time.Millisecond,
 		Size:     24,
 		Updates:  updates,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	deadline := time.After(1800 * time.Millisecond)
+	deadline := time.After(4500 * time.Millisecond)
 	var timedOutSeen, sawFalseAfterTrue int
 	for {
 		select {

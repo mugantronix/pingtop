@@ -12,9 +12,6 @@ pingtop
 # Output of the go coverage tool
 *.out
 
-# go-winres generated resource
-*.syso
-
 # Debug logs (see internal/*/debug.go — enabled via PINGTOP_DEBUG)
 pingtop-debug.log
 
