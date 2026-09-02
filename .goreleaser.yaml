@@ -1,0 +1,72 @@
+version: 2
+project_name: pingtop
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - id: pingtop
+    main: .
+    binary: pingtop
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+archives:
+  - id: pingtop
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+checksum:
+  name_template: "checksums.txt"
+source:
+  enabled: true
+  prefix_template: "{{ .ProjectName }}-{{ .Version }}/"
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^ci:"
+      - "^docs:"
+      - "^chore:"
+aurs:
+  - name: pingtop-bin
+    homepage: "https://github.com/guerrieroriccardo/pingtop"
+    description: "htop-style live dashboard for ping"
+    maintainers:
+      - 'Riccardo Guerriero <aur@guer.ro>'
+    license: "Apache-2.0"
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/pingtop-bin.git"
+    provides: ["pingtop"]
+    conflicts: ["pingtop"]
+    package: |-
+      install -Dm755 "./pingtop" "${pkgdir}/usr/bin/pingtop"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    commit_author:
+      name: Riccardo Guerriero
+      email: aur@guer.ro
+aur_sources:
+  - name: pingtop
+    homepage: "https://github.com/guerrieroriccardo/pingtop"
+    description: "htop-style live dashboard for ping"
+    maintainers:
+      - 'Riccardo Guerriero <aur@guer.ro>'
+    license: "Apache-2.0"
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/pingtop.git"
+    conflicts: ["pingtop-bin"]
+    build: |-
+      cd "$pkgname-$pkgver"
+      export CGO_ENABLED=0
+      go build -trimpath -ldflags="-s -w -X main.version=$pkgver" -o "$pkgname" .
+    package: |-
+      cd "$pkgname-$pkgver"
+      install -Dm755 "./$pkgname" "${pkgdir}/usr/bin/$pkgname"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    commit_author:
+      name: Riccardo Guerriero
+      email: aur@guer.ro
