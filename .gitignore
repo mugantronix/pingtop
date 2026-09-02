@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+pingtop
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# go-winres generated resource
+*.syso
+
+# Debug logs (see internal/*/debug.go — enabled via PINGTOP_DEBUG)
+pingtop-debug.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
