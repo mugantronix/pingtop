@@ -68,6 +68,21 @@ to start empty and add targets via `ctrl+v` once the UI is up.
 | `t`                  | Toggle SPARK column between Unicode and ASCII rendering                                                          |
 | `q` / `ctrl-c`       | Quit                                                                                                              |
 
+## Terminal setup tips
+
+**Windows Terminal:** if `ctrl+v` doesn't paste a target, Windows Terminal
+itself is intercepting the shortcut for its own clipboard paste before
+pingtop ever sees it. Go to **Settings → Actions**, find the `ctrl+v` key
+binding, and remove it. This frees the shortcut so pingtop receives it as a
+normal key event.
+
+**Windows Console Host (`conhost.exe`, classic `cmd.exe`):** the default
+font doesn't cover the Unicode block characters used by the SPARK column,
+which then render as boxes. For the best look, set the console font to
+**Cascadia Code** (Properties → Font). Alternatively, press `t` inside
+pingtop to switch SPARK to a plain-ASCII rendering that works with any font.
+
+
 ## Build from source
 
 Requires Go 1.26+.
