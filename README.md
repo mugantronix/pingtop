@@ -9,6 +9,8 @@ and shows live RTT, smoothed jitter, packet loss, sent/lost counts, TTL, and a
 sparkline per row in a sortable table. It takes IPs, hostnames, and CIDR
 ranges as arguments.
 
+![pingtop demo](docs/images/pingtop-demo.gif)
+
 ## Changes from upstream
 
 This fork **only targets Windows** and diverges from the original project in
