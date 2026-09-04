@@ -233,6 +233,17 @@ func (m Model) PendingInstall() string {
 	return m.pendingInstall
 }
 
+// PendingInstallArgs returns the live target list (m.order) at the
+// moment the update was triggered, formatted as command-line
+// arguments for the relaunched process. This is what makes an update
+// preserve targets added interactively after startup (via ctrl+v)
+// rather than silently reverting to whatever the program was
+// originally launched with — see ReplaceAndRelaunch's doc on why args
+// is caller-supplied instead of defaulting to os.Args[1:].
+func (m Model) PendingInstallArgs() []string {
+	return append([]string(nil), m.order...)
+}
+
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.waitForUpdate()}
 	if m.checkUpdate != nil {

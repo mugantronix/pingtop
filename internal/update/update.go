@@ -257,12 +257,20 @@ func verifyChecksum(data []byte, assetName string, checksumsTxt []byte) error {
 }
 
 // ReplaceAndRelaunch installs newExePath over the currently running
-// executable and starts it as a new, detached process. On success the
-// caller should exit promptly — there is nothing left for the current
-// process to do, and the new process is already running independently.
-// On failure the original executable is left in place (best effort:
-// this function tries to restore it before returning an error).
-func ReplaceAndRelaunch(newExePath string) error {
+// executable and starts it as a new, detached process with args as
+// its command-line arguments. On success the caller should exit
+// promptly — there is nothing left for the current process to do,
+// and the new process is already running independently. On failure
+// the original executable is left in place (best effort: this
+// function tries to restore it before returning an error).
+//
+// args is caller-supplied rather than defaulting to os.Args[1:] so
+// the caller can relaunch with the LIVE state of the program (e.g.
+// whatever targets are currently being pinged, added interactively
+// via paste after startup) instead of blindly repeating the original
+// command line, which would silently drop any targets added after
+// launch.
+func ReplaceAndRelaunch(newExePath string, args []string) error {
 	curExe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("os.Executable: %w", err)
@@ -286,7 +294,7 @@ func ReplaceAndRelaunch(newExePath string) error {
 		return fmt.Errorf("install new exe: %w", err)
 	}
 
-	cmd := exec.Command(curExe, os.Args[1:]...)
+	cmd := exec.Command(curExe, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -134,7 +135,27 @@ func run() error {
 	// ui.Model.PendingInstall's doc.
 	if m, ok := finalModel.(ui.Model); ok {
 		if path := m.PendingInstall(); path != "" {
-			if err := update.ReplaceAndRelaunch(path); err != nil {
+			// Rebuild the full command line for the relaunch: the
+			// original flags (so -i/--max-hosts/-k/--no-color/--size
+			// survive an update) plus the CURRENT target list —
+			// whatever's live in the UI right now, paste-added targets
+			// included — instead of the original positional args,
+			// which would silently drop anything added after launch.
+			relaunchArgs := []string{
+				"-i", interval.String(),
+				"-max-hosts", strconv.Itoa(maxHosts),
+				"-drop", strconv.Itoa(drop),
+			}
+			if keepDropped {
+				relaunchArgs = append(relaunchArgs, "-keep-dropped")
+			}
+			if noColor {
+				relaunchArgs = append(relaunchArgs, "-no-color")
+			}
+			relaunchArgs = append(relaunchArgs, "-size", strconv.Itoa(*size))
+			relaunchArgs = append(relaunchArgs, m.PendingInstallArgs()...)
+
+			if err := update.ReplaceAndRelaunch(path, relaunchArgs); err != nil {
 				return fmt.Errorf("update: %w", err)
 			}
 			// The new process is already running independently; this
