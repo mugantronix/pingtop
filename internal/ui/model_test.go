@@ -1163,10 +1163,26 @@ func TestResetStatsKeepsTargetsClearsStatsAndHistory(t *testing.T) {
 	if len(out.history) != 0 {
 		t.Errorf("expected history cleared after reset, got %v", out.history)
 	}
-	select {
-	case c := <-cmds:
-		t.Errorf("reset should not send any TargetCmd (pingers keep running), got %+v", c)
-	default:
+
+	// R must send an ActionReset per target so main's pinger manager
+	// actually restarts each goroutine with zeroed counters — clearing
+	// only the UI's local copy isn't enough, since the next StatsUpdate
+	// from an un-reset pinger would just repopulate the old cumulative
+	// numbers (this was a real bug, fixed by wiring R to ActionReset).
+	gotIDs := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case c := <-cmds:
+			if c.Action != ActionReset {
+				t.Errorf("expected ActionReset, got %+v", c)
+			}
+			gotIDs[c.ID] = true
+		default:
+			t.Fatal("expected a TargetCmd on cmds channel")
+		}
+	}
+	if !gotIDs["1.1.1.1"] || !gotIDs["8.8.8.8"] {
+		t.Errorf("expected reset commands for both targets, got %v", gotIDs)
 	}
 }
 
