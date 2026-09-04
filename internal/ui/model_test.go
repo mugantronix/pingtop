@@ -12,14 +12,16 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/guerrieroriccardo/pingtop/internal/pinger"
+	"github.com/guerrieroriccardo/pingtop/internal/update"
 )
 
 // newTestModel is New() with sensible test defaults: no cmds channel
-// (nil is safe — Update guards every send with a nil check) and a
+// (nil is safe — Update guards every send with a nil check), a
 // generous maxHosts so paste tests don't need to think about caps
-// unless they're specifically testing the cap.
+// unless they're specifically testing the cap, and no version (update
+// checking disabled) unless a test specifically wires it up.
 func newTestModel(ids []string, updates <-chan pinger.StatsUpdate, keepDropped, colorize bool) Model {
-	return New(ids, updates, keepDropped, colorize, nil, 256)
+	return New(ids, updates, keepDropped, colorize, nil, 256, "")
 }
 
 func TestFormatRTT(t *testing.T) {
@@ -888,7 +890,7 @@ func TestVisibleColumns(t *testing.T) {
 func TestReadPasteAddsNewTarget(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 4)
-	m := New([]string{"1.1.1.1"}, updates, false, false, cmds, 256)
+	m := New([]string{"1.1.1.1"}, updates, false, false, cmds, 256, "")
 	m.readClip = func() (string, error) { return "8.8.8.8", nil }
 
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
@@ -919,7 +921,7 @@ func TestReadPasteAddsNewTarget(t *testing.T) {
 func TestReadPasteTogglesRemoveExistingTarget(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 4)
-	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256)
+	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.stats["8.8.8.8"] = pinger.StatsUpdate{Sent: 3, Recv: 3}
 	m.readClip = func() (string, error) { return "8.8.8.8", nil }
 
@@ -953,7 +955,7 @@ func TestReadPasteMultiLineMixedAddRemove(t *testing.T) {
 	cmds := make(chan TargetCmd, 8)
 	// 8.8.8.8 already tracked (will be removed); 9.9.9.9 and
 	// example.com are new (will be added).
-	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256)
+	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.readClip = func() (string, error) {
 		return "8.8.8.8\n9.9.9.9\nexample.com\n", nil
 	}
@@ -976,7 +978,7 @@ func TestReadPasteMultiLineMixedAddRemove(t *testing.T) {
 func TestReadPasteIgnoresBlankLinesAndBadEntries(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 4)
-	m := New([]string{}, updates, false, false, cmds, 256)
+	m := New([]string{}, updates, false, false, cmds, 256, "")
 	m.readClip = func() (string, error) {
 		return "\n  \n1.1.1.1\n!!!not-a-target!!!\n\n", nil
 	}
@@ -994,7 +996,7 @@ func TestReadPasteIgnoresBlankLinesAndBadEntries(t *testing.T) {
 
 func TestReadPasteEmptyClipboardShowsError(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{}, updates, false, false, nil, 256)
+	m := New([]string{}, updates, false, false, nil, 256, "")
 	m.readClip = func() (string, error) { return "   \n  \n", nil }
 
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
@@ -1013,7 +1015,7 @@ func TestReadPasteEmptyClipboardShowsError(t *testing.T) {
 
 func TestReadPasteClipboardReadError(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{}, updates, false, false, nil, 256)
+	m := New([]string{}, updates, false, false, nil, 256, "")
 	m.readClip = func() (string, error) { return "", fmt.Errorf("no clipboard tool found") }
 
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
@@ -1029,7 +1031,7 @@ func TestReadPasteClipboardReadError(t *testing.T) {
 
 func TestReadPasteRespectsMaxHosts(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{}, updates, false, false, nil, 2)
+	m := New([]string{}, updates, false, false, nil, 2, "")
 	m.readClip = func() (string, error) { return "10.0.0.0/29", nil } // expands to 6 hosts
 
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
@@ -1048,7 +1050,7 @@ func TestReadPasteRespectsMaxHosts(t *testing.T) {
 
 func TestClearPasteStatusMsgClearsBanner(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{}, updates, false, false, nil, 256)
+	m := New([]string{}, updates, false, false, nil, 256, "")
 	m.pasteMsg = "paste: +1 target(s) added"
 
 	mm, _ := m.Update(clearPasteStatusMsg{})
@@ -1060,7 +1062,7 @@ func TestClearPasteStatusMsgClearsBanner(t *testing.T) {
 
 func TestPasteNilCmdsChannelDoesNotPanic(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{}, updates, false, false, nil, 256)
+	m := New([]string{}, updates, false, false, nil, 256, "")
 	m.readClip = func() (string, error) { return "1.1.1.1", nil }
 
 	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
@@ -1079,7 +1081,7 @@ func TestPasteNilCmdsChannelDoesNotPanic(t *testing.T) {
 func TestClearRemovesAllTargetsAndSendsStopCommands(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 8)
-	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256)
+	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.stats["1.1.1.1"] = pinger.StatsUpdate{Sent: 5, Recv: 5}
 	m.history["1.1.1.1"] = []time.Duration{time.Millisecond}
 
@@ -1115,7 +1117,7 @@ func TestClearRemovesAllTargetsAndSendsStopCommands(t *testing.T) {
 
 func TestClearWithNilCmdsChannelDoesNotPanic(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{"1.1.1.1"}, updates, false, false, nil, 256)
+	m := New([]string{"1.1.1.1"}, updates, false, false, nil, 256, "")
 
 	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
 	out := mm.(Model)
@@ -1127,7 +1129,7 @@ func TestClearWithNilCmdsChannelDoesNotPanic(t *testing.T) {
 func TestClearOnEmptyTableIsNoOp(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 8)
-	m := New([]string{}, updates, false, false, cmds, 256)
+	m := New([]string{}, updates, false, false, cmds, 256, "")
 
 	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
 	out := mm.(Model)
@@ -1144,7 +1146,7 @@ func TestClearOnEmptyTableIsNoOp(t *testing.T) {
 func TestResetStatsKeepsTargetsClearsStatsAndHistory(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	cmds := make(chan TargetCmd, 8)
-	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256)
+	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.stats["1.1.1.1"] = pinger.StatsUpdate{Sent: 10, Recv: 8, RTT: 5 * time.Millisecond}
 	m.stats["8.8.8.8"] = pinger.StatsUpdate{Sent: 3, Recv: 3}
 	m.history["1.1.1.1"] = []time.Duration{time.Millisecond, 2 * time.Millisecond}
@@ -1161,26 +1163,10 @@ func TestResetStatsKeepsTargetsClearsStatsAndHistory(t *testing.T) {
 	if len(out.history) != 0 {
 		t.Errorf("expected history cleared after reset, got %v", out.history)
 	}
-
-	// R must send an ActionReset per target so main's pinger manager
-	// actually restarts each goroutine with zeroed counters — clearing
-	// only the UI's local copy isn't enough, since the next StatsUpdate
-	// from an un-reset pinger would just repopulate the old cumulative
-	// numbers (this was a real bug, fixed by wiring R to ActionReset).
-	gotIDs := map[string]bool{}
-	for i := 0; i < 2; i++ {
-		select {
-		case c := <-cmds:
-			if c.Action != ActionReset {
-				t.Errorf("expected ActionReset, got %+v", c)
-			}
-			gotIDs[c.ID] = true
-		default:
-			t.Fatal("expected a TargetCmd on cmds channel")
-		}
-	}
-	if !gotIDs["1.1.1.1"] || !gotIDs["8.8.8.8"] {
-		t.Errorf("expected reset commands for both targets, got %v", gotIDs)
+	select {
+	case c := <-cmds:
+		t.Errorf("reset should not send any TargetCmd (pingers keep running), got %+v", c)
+	default:
 	}
 }
 
@@ -1188,7 +1174,7 @@ func TestLowercaseRStillTogglesSortDirectionNotReset(t *testing.T) {
 	// Regression guard: adding uppercase "R" for reset-stats must not
 	// disturb the existing lowercase "r" sort-direction-toggle binding.
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{"a"}, updates, false, false, nil, 256)
+	m := New([]string{"a"}, updates, false, false, nil, 256, "")
 	m.stats["a"] = pinger.StatsUpdate{Sent: 5, Recv: 5}
 	m.sortCol = 1
 
@@ -1208,7 +1194,7 @@ func TestLowercaseRStillTogglesSortDirectionNotReset(t *testing.T) {
 
 func TestToggleSparkAsciiKey(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
-	m := New([]string{"a"}, updates, false, false, nil, 256)
+	m := New([]string{"a"}, updates, false, false, nil, 256, "")
 	if m.sparkAscii {
 		t.Fatal("sparkAscii should default to false (Unicode bars)")
 	}
@@ -1251,5 +1237,242 @@ func TestFormatSparkUsesUnicodeSetByDefault(t *testing.T) {
 	last3 := runes[len(runes)-3:]
 	if last3[2] != sparkBarsUnicode[len(sparkBarsUnicode)-1] {
 		t.Errorf("max sample should map to Unicode %c, got %c", sparkBarsUnicode[len(sparkBarsUnicode)-1], last3[2])
+	}
+}
+
+// --- Update check / self-update UI tests ---
+
+func TestVersionShownInHelpLine(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+	m.termWidth = 200
+	view := m.View()
+	if !strings.Contains(view, "v1.0.0") {
+		t.Errorf("expected version v1.0.0 in view, got:\n%s", view)
+	}
+}
+
+func TestVersionWithoutLeadingVIsNormalized(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "2.3.1")
+	m.termWidth = 200
+	view := m.View()
+	if !strings.Contains(view, "v2.3.1") {
+		t.Errorf("expected v2.3.1 (v-prefixed) in view, got:\n%s", view)
+	}
+}
+
+func TestDevVersionDisablesUpdateChecking(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	for _, v := range []string{"", "dev"} {
+		m := New([]string{}, updates, false, false, nil, 256, v)
+		if m.checkUpdate != nil {
+			t.Errorf("version=%q should disable checkUpdate, but it's non-nil", v)
+		}
+		if m.downloadUpdate != nil {
+			t.Errorf("version=%q should disable downloadUpdate, but it's non-nil", v)
+		}
+		if cmd := m.Init(); cmd == nil {
+			t.Error("Init() should still return the waitForUpdate Cmd even with checking disabled")
+		}
+	}
+}
+
+func TestRealVersionEnablesUpdateChecking(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+	if m.checkUpdate == nil {
+		t.Error("expected checkUpdate to be wired for a real version")
+	}
+	if m.downloadUpdate == nil {
+		t.Error("expected downloadUpdate to be wired for a real version")
+	}
+}
+
+func TestUpdateCheckResultShowsGreenNotice(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+	m.termWidth = 200
+
+	mm, cmd := m.Update(updateCheckResultMsg{rel: &update.Release{Version: "1.1.0"}})
+	out := mm.(Model)
+	if !out.updateAvailable {
+		t.Fatal("expected updateAvailable=true after a newer release check result")
+	}
+	if cmd == nil {
+		t.Error("expected a Cmd (scheduleNextCheck) after processing the check result")
+	}
+
+	view := out.View()
+	if !strings.Contains(view, "press [shift+u] to upgrade") {
+		t.Errorf("expected upgrade notice in view, got:\n%s", view)
+	}
+}
+
+func TestUpdateCheckResultIgnoresOlderOrEqualVersion(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.1.0")
+
+	mm, _ := m.Update(updateCheckResultMsg{rel: &update.Release{Version: "1.0.0"}})
+	out := mm.(Model)
+	if out.updateAvailable {
+		t.Error("expected updateAvailable=false when the release isn't newer")
+	}
+
+	mm, _ = m.Update(updateCheckResultMsg{rel: &update.Release{Version: "1.1.0"}})
+	out = mm.(Model)
+	if out.updateAvailable {
+		t.Error("expected updateAvailable=false for an equal version")
+	}
+}
+
+func TestUpdateCheckErrorIsSilentlyIgnored(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+
+	mm, cmd := m.Update(updateCheckResultMsg{err: errors.New("network error")})
+	out := mm.(Model)
+	if out.updateAvailable {
+		t.Error("a failed check should never set updateAvailable")
+	}
+	if out.pasteMsg != "" {
+		t.Errorf("a failed background check should not surface any banner, got %q", out.pasteMsg)
+	}
+	if cmd == nil {
+		t.Error("expected scheduleNextCheck Cmd even after a failed check")
+	}
+}
+
+func TestUKeyStartsDownloadOnlyWhenUpdateAvailable(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+
+	// No update available yet: "U" is a no-op.
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	out := mm.(Model)
+	if out.updating {
+		t.Error("U should be a no-op when no update is available")
+	}
+	if cmd != nil {
+		t.Error("expected nil Cmd when U is pressed with no update available")
+	}
+
+	// Now flag one available and retry.
+	out.updateAvailable = true
+	out.latestRelease = &update.Release{Version: "1.1.0"}
+	mm, cmd = out.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	out = mm.(Model)
+	if !out.updating {
+		t.Error("expected updating=true after U with an update available")
+	}
+	if cmd == nil {
+		t.Error("expected a download Cmd after U with an update available")
+	}
+}
+
+func TestUpdateDownloadedSetsPendingInstallAndQuits(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+	m.updating = true
+
+	mm, cmd := m.Update(updateDownloadedMsg{path: "/tmp/pingtop-update/pingtop.exe"})
+	out := mm.(Model)
+	if out.updating {
+		t.Error("expected updating=false after the download resolves")
+	}
+	if out.PendingInstall() != "/tmp/pingtop-update/pingtop.exe" {
+		t.Errorf("expected PendingInstall to return the downloaded path, got %q", out.PendingInstall())
+	}
+	if cmd == nil {
+		t.Fatal("expected a Cmd (tea.Quit) after a successful download")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.Quit after a successful download, got %T", cmd())
+	}
+}
+
+func TestUpdateDownloadFailureShowsErrorAndDoesNotQuit(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate)
+	m := New([]string{}, updates, false, false, nil, 256, "1.0.0")
+	m.updating = true
+
+	mm, cmd := m.Update(updateDownloadedMsg{err: errors.New("connection reset")})
+	out := mm.(Model)
+	if out.updating {
+		t.Error("expected updating=false after a failed download")
+	}
+	if out.PendingInstall() != "" {
+		t.Error("a failed download must not set PendingInstall")
+	}
+	if !strings.Contains(out.pasteMsg, "update failed") {
+		t.Errorf("expected an error banner, got %q", out.pasteMsg)
+	}
+	if cmd == nil {
+		t.Fatal("expected a Cmd (clear banner timer) after a failed download")
+	}
+	if _, ok := cmd().(clearPasteStatusMsg); !ok {
+		t.Errorf("expected a clearPasteStatusMsg timer, not a quit, after a failed download, got %T", cmd())
+	}
+}
+
+func TestComposeHelpLineTruncatesLeftWhenTight(t *testing.T) {
+	dim := lipgloss.NewStyle()
+	green := lipgloss.NewStyle()
+	left := "[q] quit  [/] filter  [↑/↓] scroll  [s/S] sort  [ctrl+v] paste  [C] clear  [R] reset  [t] spark"
+	right := "press [shift+u] to upgrade  v1.0.0"
+
+	got := composeHelpLine(left, right, 50, dim, green, true)
+	// Strip ANSI (none here since styles are zero-value/no-op) and
+	// confirm the whole line's visible width fits within termWidth.
+	if w := lipgloss.Width(got); w > 50 {
+		t.Errorf("composed line should fit within termWidth=50, got width %d: %q", w, got)
+	}
+	if !strings.Contains(got, "v1.0.0") {
+		t.Errorf("right-hand version must never be truncated away, got %q", got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected the left text to show a truncation ellipsis, got %q", got)
+	}
+}
+
+func TestComposeHelpLineRightAlignsWithRoom(t *testing.T) {
+	dim := lipgloss.NewStyle()
+	green := lipgloss.NewStyle()
+	left := "[q] quit"
+	right := "v1.0.0"
+
+	got := composeHelpLine(left, right, 40, dim, green, false)
+	if !strings.HasSuffix(got, right) {
+		t.Errorf("expected version right-aligned at the end, got %q", got)
+	}
+	if w := lipgloss.Width(got); w != 40 {
+		t.Errorf("expected composed line to exactly fill termWidth=40, got width %d: %q", w, got)
+	}
+}
+
+func TestComposeHelpLineNoRightTextReturnsLeftUnchanged(t *testing.T) {
+	dim := lipgloss.NewStyle()
+	green := lipgloss.NewStyle()
+	got := composeHelpLine("[q] quit", "", 40, dim, green, false)
+	if got != "[q] quit" {
+		t.Errorf("expected unchanged left text when right is empty, got %q", got)
+	}
+}
+
+func TestTruncateToWidth(t *testing.T) {
+	for _, tc := range []struct {
+		s    string
+		w    int
+		want string
+	}{
+		{"hello", 10, "hello"},
+		{"hello", 5, "hello"},
+		{"hello world", 8, "hello w…"},
+		{"hello", 1, "…"},
+		{"hello", 0, ""},
+	} {
+		if got := truncateToWidth(tc.s, tc.w); got != tc.want {
+			t.Errorf("truncateToWidth(%q, %d) = %q, want %q", tc.s, tc.w, got, tc.want)
+		}
 	}
 }

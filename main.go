@@ -13,7 +13,15 @@ import (
 	"github.com/guerrieroriccardo/pingtop/internal/pinger"
 	"github.com/guerrieroriccardo/pingtop/internal/target"
 	"github.com/guerrieroriccardo/pingtop/internal/ui"
+	"github.com/guerrieroriccardo/pingtop/internal/update"
 )
+
+// version is set at build time via -ldflags "-X main.version=...",
+// as goreleaser's config here already does. Left as "dev" for
+// unadorned `go build` — the ui package treats "dev" (and "") as
+// "update checking disabled", since there's nothing meaningful to
+// compare a version-less local build against.
+var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
@@ -23,6 +31,11 @@ func main() {
 }
 
 func run() error {
+	// Best-effort cleanup of a "<exe>.old" left behind by a previous
+	// self-update (see internal/update.ReplaceAndRelaunch) — safe to
+	// attempt on every startup regardless of whether one exists.
+	update.CleanupOldExe()
+
 	interval := flag.Duration("i", time.Second, "interval between pings")
 
 	var maxHosts int
@@ -102,8 +115,8 @@ func run() error {
 	// env var disables color — including "0". Don't strconv-parse it.
 	colorize := !noColor && os.Getenv("NO_COLOR") == ""
 
-	prog := tea.NewProgram(ui.New(ids, updates, keepDropped, colorize, cmds, maxHosts), tea.WithAltScreen())
-	_, runErr := prog.Run()
+	prog := tea.NewProgram(ui.New(ids, updates, keepDropped, colorize, cmds, maxHosts, version), tea.WithAltScreen())
+	finalModel, runErr := prog.Run()
 
 	cancel()
 	mgr.wait()
@@ -111,6 +124,22 @@ func run() error {
 
 	if runErr != nil {
 		return fmt.Errorf("ui: %w", runErr)
+	}
+
+	// If the person pressed "U" and the download succeeded, the model
+	// quit with a pending install path set rather than performing the
+	// filesystem swap itself — doing it here, after tea.Program has
+	// fully restored the terminal (exited the alt screen, restored
+	// the cursor), avoids corrupting the screen mid-update. See
+	// ui.Model.PendingInstall's doc.
+	if m, ok := finalModel.(ui.Model); ok {
+		if path := m.PendingInstall(); path != "" {
+			if err := update.ReplaceAndRelaunch(path); err != nil {
+				return fmt.Errorf("update: %w", err)
+			}
+			// The new process is already running independently; this
+			// one has nothing left to do.
+		}
 	}
 	return nil
 }

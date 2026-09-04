@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/guerrieroriccardo/pingtop/internal/clipboard"
 	"github.com/guerrieroriccardo/pingtop/internal/pinger"
 	"github.com/guerrieroriccardo/pingtop/internal/target"
+	"github.com/guerrieroriccardo/pingtop/internal/update"
 )
 
 // columnDef describes one table column. Order in the columns slice
@@ -94,6 +96,46 @@ const pasteStatusDuration = 3 * time.Second
 // clearPasteStatusMsg fires after pasteStatusDuration to clear the banner.
 type clearPasteStatusMsg struct{}
 
+// updateCheckInterval is how often Model re-checks GitHub for a newer
+// release after the initial check on startup.
+const updateCheckInterval = time.Hour
+
+// updateCheckTimeout bounds a single check-for-update network call —
+// this is a background courtesy check, not something the person is
+// waiting on, so it should give up quietly well before it could ever
+// feel like the program hung.
+const updateCheckTimeout = 10 * time.Second
+
+// updateDownloadTimeout bounds the download+verify Cmd triggered by
+// pressing "U". Generous compared to updateCheckTimeout since it's
+// fetching an actual multi-MB binary, but still bounded so a stalled
+// connection doesn't leave the person stuck on the "downloading..."
+// screen forever.
+const updateDownloadTimeout = 2 * time.Minute
+
+// updateCheckResultMsg carries the outcome of a background
+// check-for-update Cmd back into the Bubble Tea update loop. A nil
+// Release with a nil error means "checked successfully, nothing
+// newer" — distinct from err != nil, which means the check itself
+// failed (network error, GitHub API hiccup) and is silently ignored
+// rather than shown to the person: a background version check is not
+// something worth interrupting them about when it fails.
+type updateCheckResultMsg struct {
+	rel *update.Release
+	err error
+}
+
+// scheduleNextCheckMsg fires updateCheckInterval after the previous
+// check resolved, triggering the next one.
+type scheduleNextCheckMsg struct{}
+
+// updateDownloadedMsg carries the outcome of the download Cmd
+// triggered by pressing "U".
+type updateDownloadedMsg struct {
+	path string
+	err  error
+}
+
 // Model is the dashboard state. Construct it with New, then pass it to
 // tea.NewProgram.
 type Model struct {
@@ -127,6 +169,15 @@ type Model struct {
 	// so the "t" key lets the person switch at runtime and keep
 	// whichever looks right on their setup.
 	sparkAscii bool
+
+	// --- update check / self-update state ---
+	version         string                                          // this build's own version (e.g. "1.0.0"); "" or "dev" disables the update check entirely
+	checkUpdate     func(ctx context.Context) (*update.Release, error) // swappable in tests; nil disables checking
+	downloadUpdate  func(ctx context.Context, rel *update.Release) (exePath string, err error) // swappable in tests; nil disables the "U" key
+	updateAvailable bool
+	latestRelease   *update.Release
+	updating        bool   // true while a download is in flight, after pressing "U"
+	pendingInstall  string // set once a downloaded update is ready to install; main.go checks this after tea.Program exits
 }
 
 // New builds the initial model. ids is the stable display order
@@ -141,8 +192,13 @@ type Model struct {
 // corresponding goroutines. maxHosts bounds how many targets a single
 // paste (which may contain a CIDR) can expand to, matching the
 // command-line --max-hosts semantics.
-func New(ids []string, updates <-chan pinger.StatsUpdate, keepDropped, colorize bool, cmds chan<- TargetCmd, maxHosts int) Model {
-	return Model{
+//
+// version is this build's own version string (e.g. "1.0.0"), shown at
+// the right edge of the help line. An empty string or "dev" disables
+// the update check entirely — there is nothing meaningful to compare
+// a version-less dev build against.
+func New(ids []string, updates <-chan pinger.StatsUpdate, keepDropped, colorize bool, cmds chan<- TargetCmd, maxHosts int, version string) Model {
+	m := Model{
 		order:       ids,
 		updates:     updates,
 		stats:       make(map[string]pinger.StatsUpdate, len(ids)),
@@ -154,11 +210,35 @@ func New(ids []string, updates <-chan pinger.StatsUpdate, keepDropped, colorize 
 		maxHosts:    maxHosts,
 		cmds:        cmds,
 		readClip:    clipboard.Read,
+		version:     version,
 	}
+	if version != "" && version != "dev" {
+		m.checkUpdate = func(ctx context.Context) (*update.Release, error) {
+			return update.FetchLatest(ctx)
+		}
+		m.downloadUpdate = func(ctx context.Context, rel *update.Release) (string, error) {
+			return update.Download(ctx, rel)
+		}
+	}
+	return m
+}
+
+// PendingInstall returns the local path of a downloaded update ready
+// to be installed, or "" if none is pending. Only meaningful after
+// tea.Program.Run() has returned (the model quit via the "U" flow,
+// see Update's handling of updateDownloadedMsg) — main.go checks this
+// on the final model to decide whether to call
+// update.ReplaceAndRelaunch before exiting.
+func (m Model) PendingInstall() string {
+	return m.pendingInstall
 }
 
 func (m Model) Init() tea.Cmd {
-	return m.waitForUpdate()
+	cmds := []tea.Cmd{m.waitForUpdate()}
+	if m.checkUpdate != nil {
+		cmds = append(cmds, m.checkForUpdateCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 // waitForUpdate returns a Cmd that blocks on the updates channel and
@@ -232,6 +312,49 @@ func parseTargetsText(text string, maxHosts int) pasteResultMsg {
 // after a delay, so it doesn't stick around forever.
 func clearPasteStatusAfter(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(time.Time) tea.Msg { return clearPasteStatusMsg{} })
+}
+
+// checkForUpdateCmd returns a Cmd that checks GitHub for a newer
+// release. Nil if m.checkUpdate is nil (update checking disabled —
+// see New's doc on the version parameter).
+func (m Model) checkForUpdateCmd() tea.Cmd {
+	checkFn := m.checkUpdate
+	if checkFn == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+		defer cancel()
+		rel, err := checkFn(ctx)
+		return updateCheckResultMsg{rel: rel, err: err}
+	}
+}
+
+// scheduleNextCheck returns a Cmd that fires scheduleNextCheckMsg
+// after updateCheckInterval, so the update check repeats periodically
+// without the person having to restart the program to notice a
+// release that came out after they launched it.
+func scheduleNextCheck() tea.Cmd {
+	return tea.Tick(updateCheckInterval, func(time.Time) tea.Msg { return scheduleNextCheckMsg{} })
+}
+
+// downloadUpdateCmd returns a Cmd that downloads and verifies rel via
+// m.downloadUpdate. Nil if m.downloadUpdate is nil or rel is nil —
+// both should be impossible by the time this is called (gated by the
+// "U" key handler in Update), but returning nil rather than a Cmd
+// that immediately errors keeps the caller's logic simple either way.
+func (m Model) downloadUpdateCmd() tea.Cmd {
+	downloadFn := m.downloadUpdate
+	rel := m.latestRelease
+	if downloadFn == nil || rel == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), updateDownloadTimeout)
+		defer cancel()
+		path, err := downloadFn(ctx, rel)
+		return updateDownloadedMsg{path: path, err: err}
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -326,6 +449,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clearPasteStatusMsg:
 		m.pasteMsg = ""
 		return m, nil
+
+	case updateCheckResultMsg:
+		// A failed check (network hiccup, GitHub API error) is
+		// silently ignored — see updateCheckResultMsg's doc. Either
+		// way, schedule the next periodic check.
+		if msg.err == nil && msg.rel != nil && update.IsNewer(m.version, msg.rel.Version) {
+			m.updateAvailable = true
+			m.latestRelease = msg.rel
+		}
+		return m, scheduleNextCheck()
+
+	case scheduleNextCheckMsg:
+		return m, m.checkForUpdateCmd()
+
+	case updateDownloadedMsg:
+		m.updating = false
+		if msg.err != nil {
+			m.pasteMsg = "update failed: " + msg.err.Error()
+			return m, clearPasteStatusAfter(pasteStatusDuration)
+		}
+		// Hand off to main.go: quitting here (rather than calling
+		// update.ReplaceAndRelaunch directly) lets Bubble Tea restore
+		// the terminal (exit the alt screen, re-show the cursor)
+		// before any filesystem surgery happens on the running exe.
+		// See PendingInstall's doc.
+		m.pendingInstall = msg.path
+		return m, tea.Quit
 
 	case tea.KeyMsg:
 		debugLog("KeyMsg type=%v runes=%q str=%q alt=%v", msg.Type, msg.Runes, msg.String(), msg.Alt)
@@ -435,6 +585,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// auto-detected.
 			m.sparkAscii = !m.sparkAscii
 			return m, nil
+		case "U":
+			// Start downloading the update flagged by the background
+			// check. Guarded on updateAvailable/latestRelease/
+			// downloadUpdate so a stray "U" before a check completes
+			// (or on a dev build with update checking disabled) is a
+			// harmless no-op rather than a nil-pointer risk; `updating`
+			// additionally prevents a second concurrent download if
+			// the person mashes the key.
+			if m.updateAvailable && m.latestRelease != nil && m.downloadUpdate != nil && !m.updating {
+				m.updating = true
+				return m, m.downloadUpdateCmd()
+			}
+			return m, nil
 		}
 		return m, nil
 
@@ -461,6 +624,8 @@ func (m Model) View() string {
 	switch {
 	case m.filterMode:
 		text = fmt.Sprintf("/%s█  [enter] apply  [esc] clear", m.filter)
+	case m.updating:
+		text = "downloading update..."
 	case m.pasteMsg != "":
 		text = m.pasteMsg + "  [ctrl+v] paste target"
 	case len(m.order) == 0:
@@ -473,10 +638,101 @@ func (m Model) View() string {
 	default:
 		text = "[q] quit  [/] filter  [↑/↓] scroll  [s/S] sort  [ctrl+v] paste  [C] clear  [R] reset  [t] spark"
 	}
-	help := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Render(text)
+
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	green := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+
+	// Right-hand segment: version always shown (when known), with a
+	// green "upgrade available" notice prepended when one is. Built
+	// and measured in plain text first, then styled, so width math
+	// below works against visible character counts rather than
+	// ANSI-escaped strings.
+	var rightPlain string
+	if m.updateAvailable {
+		rightPlain = "press [shift+u] to upgrade"
+	}
+	if m.version != "" {
+		if rightPlain != "" {
+			rightPlain += "  "
+		}
+		rightPlain += "v" + strings.TrimPrefix(m.version, "v")
+	}
+
+	help := composeHelpLine(text, rightPlain, m.termWidth, dim, green, m.updateAvailable)
 	return m.renderTable() + "\n" + help
+}
+
+// composeHelpLine lays out the bottom status line: left is the
+// contextual help/status text, right is the version (optionally
+// preceded by the green upgrade notice), right-aligned to the
+// terminal's far edge. Per the requirement that the version/upgrade
+// notice always stay on one line, the LEFT text is truncated (with a
+// trailing "…") if there isn't room for both — the right-hand segment
+// is short and important enough to never be the one sacrificed.
+// termWidth <= 0 (not yet known) skips alignment entirely and just
+// concatenates both halves, consistent with how the rest of the UI
+// treats an unknown terminal size as "don't truncate anything yet".
+func composeHelpLine(left, rightPlain string, termWidth int, dim, green lipgloss.Style, upgradeAvailable bool) string {
+	if rightPlain == "" {
+		return dim.Render(left)
+	}
+	if termWidth <= 0 {
+		return dim.Render(left) + "  " + renderRight(rightPlain, upgradeAvailable, dim, green)
+	}
+
+	rightWidth := lipgloss.Width(rightPlain)
+	avail := termWidth - rightWidth - 2 // 2-space gap between left and right
+	if avail < 0 {
+		avail = 0
+	}
+	if lipgloss.Width(left) > avail {
+		left = truncateToWidth(left, avail)
+	}
+
+	leftRendered := dim.Render(left)
+	rightRendered := renderRight(rightPlain, upgradeAvailable, dim, green)
+
+	gap := termWidth - lipgloss.Width(left) - rightWidth
+	if gap < 1 {
+		gap = 1
+	}
+	return leftRendered + strings.Repeat(" ", gap) + rightRendered
+}
+
+// renderRight styles rightPlain: if it starts with the upgrade notice
+// (upgradeAvailable is true), that portion renders green and the
+// version portion (after the "  " separator) renders dim; otherwise
+// the whole string — just the version — renders dim.
+func renderRight(rightPlain string, upgradeAvailable bool, dim, green lipgloss.Style) string {
+	if !upgradeAvailable {
+		return dim.Render(rightPlain)
+	}
+	const notice = "press [shift+u] to upgrade"
+	if rest, ok := strings.CutPrefix(rightPlain, notice); ok {
+		return green.Render(notice) + dim.Render(rest)
+	}
+	// Shouldn't happen given how rightPlain is built, but fall back to
+	// all-dim rather than mis-rendering if it ever does.
+	return dim.Render(rightPlain)
+}
+
+// truncateToWidth shortens s to at most w visible characters, adding
+// a trailing ellipsis if anything was cut. Assumes s is effectively
+// single-width per rune (true for this program's help text — plain
+// ASCII plus the odd arrow/em-dash), so rune count doubles as display
+// width without needing full grapheme-width accounting.
+func truncateToWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
 }
 
 // renderTable builds a fresh lipgloss/table on every call. lipgloss/table
