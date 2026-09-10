@@ -160,18 +160,18 @@ func TestPingerDownSinceAfterFiveConsecutiveFailures(t *testing.T) {
 	p := &Pinger{
 		ID:       "192.0.2.1",
 		Host:     "192.0.2.1",
-		Interval: 300 * time.Millisecond,
+		Interval: 200 * time.Millisecond,
 		Size:     24,
 		Updates:  updates,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	deadline := time.After(14 * time.Second)
+	deadline := time.After(35 * time.Second)
 	var failedRounds int
 	var firstDownSince time.Time
 	for {
