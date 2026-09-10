@@ -109,11 +109,11 @@ func TestBuildRowsInitial(t *testing.T) {
 		t.Errorf("rows lost their order: %v", rows)
 	}
 	for _, r := range rows {
-		if len(r) != 10 {
-			t.Errorf("expected 10 cells, got %d in %v", len(r), r)
+		if len(r) != 11 {
+			t.Errorf("expected 11 cells, got %d in %v", len(r), r)
 			continue
 		}
-		for i := 1; i <= 8; i++ {
+		for i := 1; i <= 9; i++ {
 			if r[i] != "—" {
 				t.Errorf("expected placeholder at index %d, got %q in %v", i, r[i], r)
 			}
@@ -333,15 +333,15 @@ func TestFilterCaseInsensitive(t *testing.T) {
 }
 
 func TestFormatSparkEmpty(t *testing.T) {
-	got := formatSpark(nil, sparkWidth, false)
+	got := formatSpark(nil, sparkWidth, false, styler{})
 	if got != strings.Repeat(" ", sparkWidth) {
 		t.Errorf("empty history should render as %d spaces, got %q", sparkWidth, got)
 	}
 }
 
 func TestFormatSparkAllEqual(t *testing.T) {
-	h := []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}
-	got := formatSpark(h, sparkWidth, false)
+	h := []sparkSample{{rtt: 10 * time.Millisecond}, {rtt: 10 * time.Millisecond}, {rtt: 10 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, false, styler{})
 	mid := string(sparkBarsUnicode[len(sparkBarsUnicode)/2])
 	// Three middle bars, padded on the left to sparkWidth.
 	want := strings.Repeat(" ", sparkWidth-3) + strings.Repeat(mid, 3)
@@ -351,8 +351,8 @@ func TestFormatSparkAllEqual(t *testing.T) {
 }
 
 func TestFormatSparkScalesMinMax(t *testing.T) {
-	h := []time.Duration{1 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
-	got := formatSpark(h, sparkWidth, false)
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {rtt: 50 * time.Millisecond}, {rtt: 100 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, false, styler{})
 	runes := []rune(got)
 	// Last three runes are the data; min should be first bar, max should be last bar.
 	last3 := runes[len(runes)-3:]
@@ -365,34 +365,89 @@ func TestFormatSparkScalesMinMax(t *testing.T) {
 }
 
 func TestFormatSparkRespectsWidth(t *testing.T) {
-	got := formatSpark(nil, 50, false)
+	got := formatSpark(nil, 50, false, styler{})
 	if got != strings.Repeat(" ", 50) {
 		t.Errorf("empty history at width=50 should render as 50 spaces, got %d chars", len([]rune(got)))
 	}
 }
 
+func TestFormatSparkDownSamplesRenderAsTallestBar(t *testing.T) {
+	// A down sample must always render as the tallest bar, regardless
+	// of amplitude (it carries no meaningful rtt) — the outage itself
+	// is the signal, not a scaled height.
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {down: true}, {rtt: 2 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, false, styler{})
+	runes := []rune(got)
+	last3 := runes[len(runes)-3:]
+	tallest := sparkBarsUnicode[len(sparkBarsUnicode)-1]
+	if last3[1] != tallest {
+		t.Errorf("down sample should render as tallest bar %c, got %c", tallest, last3[1])
+	}
+}
+
+func TestFormatSparkDownSamplesColoredCriticalWhenEnabled(t *testing.T) {
+	// Force ANSI so the renderer actually emits codes (see
+	// TestStylerEnabledAddsANSI for the same pattern/reasoning).
+	old := lipgloss.DefaultRenderer().ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(old)
+
+	st := newStyler(true)
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {down: true}}
+	got := formatSpark(h, sparkWidth, false, st)
+	if !strings.Contains(got, "\x1b[") {
+		t.Errorf("expected a down sample to carry an ANSI escape when colorize is enabled, got %q", got)
+	}
+}
+
+func TestFormatSparkDownSamplesPlainWhenStylerDisabled(t *testing.T) {
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {down: true}}
+	got := formatSpark(h, sparkWidth, false, styler{})
+	if strings.Contains(got, "\x1b[") {
+		t.Errorf("expected no ANSI escapes with a disabled styler, got %q", got)
+	}
+}
+
+func TestFormatSparkDownSamplesExcludedFromMinMaxScaling(t *testing.T) {
+	// A single down sample sitting among otherwise-identical RTTs must
+	// not distort the scale for the real samples (e.g. by being
+	// treated as an RTT of 0, which would otherwise widen the range
+	// and mute the up samples' bar-height differences).
+	h := []sparkSample{{rtt: 10 * time.Millisecond}, {down: true}, {rtt: 10 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, false, styler{})
+	runes := []rune(got)
+	last3 := runes[len(runes)-3:]
+	mid := sparkBarsUnicode[len(sparkBarsUnicode)/2]
+	if last3[0] != mid {
+		t.Errorf("equal up-samples around a down sample should still map to the middle bar %c, got %c", mid, last3[0])
+	}
+	if last3[2] != mid {
+		t.Errorf("equal up-samples around a down sample should still map to the middle bar %c, got %c", mid, last3[2])
+	}
+}
+
 func TestAppendHistoryRingBuffer(t *testing.T) {
-	h := make(map[string][]time.Duration)
+	h := make(map[string][]sparkSample)
 	for i := 0; i < maxSparkWidth+5; i++ {
-		appendHistory(h, "x", time.Duration(i)*time.Millisecond)
+		appendHistory(h, "x", sparkSample{rtt: time.Duration(i) * time.Millisecond})
 	}
 	if len(h["x"]) != maxSparkWidth {
 		t.Errorf("history should cap at %d samples, got %d", maxSparkWidth, len(h["x"]))
 	}
 	// The oldest 5 samples should have been evicted; the buffer's first
 	// sample should be sample #5 (zero-indexed).
-	if h["x"][0] != 5*time.Millisecond {
-		t.Errorf("oldest sample should be 5ms, got %v", h["x"][0])
+	if h["x"][0].rtt != 5*time.Millisecond {
+		t.Errorf("oldest sample should be 5ms, got %v", h["x"][0].rtt)
 	}
 }
 
 func TestEffectiveSparkWidthClaimsSlack(t *testing.T) {
-	// All 10 columns visible total to 28+10+10+10+10+10+8+12+6+(20+2)=126.
-	// At termWidth=166 there are 40 chars of slack — spark should claim it.
-	got := effectiveSparkWidth(166)
-	want := sparkWidth + (166 - 126)
+	// All 11 columns visible total to 28+10+10+10+10+10+8+8+12+6+(20+2)=134.
+	// At termWidth=174 there are 40 chars of slack — spark should claim it.
+	got := effectiveSparkWidth(174)
+	want := sparkWidth + (174 - 134)
 	if got != want {
-		t.Errorf("at termWidth=166 spark should be %d, got %d", want, got)
+		t.Errorf("at termWidth=174 spark should be %d, got %d", want, got)
 	}
 }
 
@@ -404,10 +459,10 @@ func TestEffectiveSparkWidthCapped(t *testing.T) {
 }
 
 func TestEffectiveSparkWidthDefaultWhenNoSlack(t *testing.T) {
-	// At termWidth=126 the columns exactly fill: no slack.
-	got := effectiveSparkWidth(126)
+	// At termWidth=134 the columns exactly fill: no slack.
+	got := effectiveSparkWidth(134)
 	if got != sparkWidth {
-		t.Errorf("at termWidth=126 (exact fit) spark should be default %d, got %d", sparkWidth, got)
+		t.Errorf("at termWidth=134 (exact fit) spark should be default %d, got %d", sparkWidth, got)
 	}
 }
 
@@ -425,15 +480,50 @@ func TestUpdateAppendsHistoryOnRTT(t *testing.T) {
 
 	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, RTT: 3 * time.Millisecond})
 	out := mm.(Model)
-	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0] != 3*time.Millisecond {
-		t.Errorf("expected one 3ms sample, got %v", out.history["1.1.1.1"])
+	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0].rtt != 3*time.Millisecond || out.history["1.1.1.1"][0].down {
+		t.Errorf("expected one non-down 3ms sample, got %v", out.history["1.1.1.1"])
 	}
 
-	// An RTT=0 message (OnSend snapshot) should NOT append.
-	mm, _ = out.Update(statsMsg{TargetID: "1.1.1.1", Sent: 2, Recv: 1, RTT: 0})
+	// A pre-send snapshot reports the SAME Sent as the previous
+	// round's outcome (see run_windows.go's preSend/snapshot split) —
+	// that's precisely what distinguishes it from a genuine new round
+	// for spark-append purposes. Sent:1 here (not 2) is what a real
+	// pre-send for the second tick actually looks like.
+	mm, _ = out.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, RTT: 0})
 	out = mm.(Model)
 	if len(out.history["1.1.1.1"]) != 1 {
-		t.Errorf("RTT=0 message should not append, got %v", out.history["1.1.1.1"])
+		t.Errorf("a pre-send snapshot (Sent unchanged) should not append, got %v", out.history["1.1.1.1"])
+	}
+}
+
+// TestUpdateAppendsDownSampleOnTimeout confirms a timed-out round
+// still gets recorded in the sparkline (as a down sample), not just
+// silently skipped the way the old msg.RTT>0 check would have — an
+// outage needs to be visible IN the spark history, not just leave it
+// paused. See the Sent-based genuine-round detection this replaced.
+func TestUpdateAppendsDownSampleOnTimeout(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	m := newTestModel([]string{"1.1.1.1"}, updates, false, false)
+
+	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, RTT: 3 * time.Millisecond})
+	out := mm.(Model)
+
+	// Pre-send for round 2 (Sent unchanged from round 1's outcome).
+	mm, _ = out.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, TimedOut: true})
+	out = mm.(Model)
+	if len(out.history["1.1.1.1"]) != 1 {
+		t.Fatalf("pre-send should not append, got %v", out.history["1.1.1.1"])
+	}
+
+	// Round 2's actual timeout outcome: Sent advances to 2, Recv stays 1.
+	mm, _ = out.Update(statsMsg{TargetID: "1.1.1.1", Sent: 2, Recv: 1, TimedOut: true})
+	out = mm.(Model)
+	hist := out.history["1.1.1.1"]
+	if len(hist) != 2 {
+		t.Fatalf("expected a second sample appended for the timeout round, got %v", hist)
+	}
+	if !hist[1].down {
+		t.Errorf("expected the timeout round's sample to be marked down, got %+v", hist[1])
 	}
 }
 
@@ -481,6 +571,49 @@ func TestTimedOutKeepsStaleValueButTurnsCritical(t *testing.T) {
 	}
 	if level := rttLevel(got); level != levelGood {
 		t.Errorf("expected levelGood after recovering from timeout, got %d", level)
+	}
+}
+
+// --- DOWN column tests ---
+
+func TestFormatDownNotDown(t *testing.T) {
+	if got := formatDown(pinger.StatsUpdate{}); got != "—" {
+		t.Errorf("expected placeholder when DownSince is zero, got %q", got)
+	}
+}
+
+func TestFormatDownShowsElapsedSeconds(t *testing.T) {
+	s := pinger.StatsUpdate{DownSince: time.Now().Add(-7 * time.Second)}
+	got := formatDown(s)
+	// Allow a small tolerance since time.Since ticks forward between
+	// setting DownSince above and formatDown's own time.Since call.
+	if got != "7s" && got != "8s" {
+		t.Errorf("expected approximately 7s elapsed, got %q", got)
+	}
+}
+
+func TestDownLevel(t *testing.T) {
+	if got := downLevel(pinger.StatsUpdate{}); got != levelNeutral {
+		t.Errorf("expected levelNeutral when not down, got %d", got)
+	}
+	down := pinger.StatsUpdate{DownSince: time.Now()}
+	if got := downLevel(down); got != levelCrit {
+		t.Errorf("expected levelCrit when down, got %d", got)
+	}
+}
+
+func TestViewShowsDownColumnWhenTargetIsDown(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	m := newTestModel([]string{"1.1.1.1"}, updates, false, false)
+	m.termWidth = 200
+
+	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 10, Recv: 0, TimedOut: true, DownSince: time.Now().Add(-12 * time.Second)})
+	view := mm.(Model).View()
+	if !strings.Contains(view, "DOWN") {
+		t.Errorf("expected DOWN column header in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "12s") {
+		t.Errorf("expected the down duration in view, got:\n%s", view)
 	}
 }
 
@@ -770,10 +903,11 @@ func TestSortCycleBackwardsThroughAllColumns(t *testing.T) {
 func TestSortCycleSkipsHiddenColumns(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate)
 	m := newTestModel([]string{"a"}, updates, false, false)
-	// At termWidth=70 the responsive layout hides MIN/AVG/MAX (tier 3)
-	// AND SENT/LOST (tier 2). Remaining sortable visible columns are
-	// TARGET(0), RTT(1), JITTER(5), LOSS%(6). SPARK is visible but not
-	// sortable and should be skipped.
+	// At termWidth=70 the responsive layout hides MIN/AVG/MAX (tier 3),
+	// SENT/LOST and TTL (tier 2), and SPARK (tier 1) — only tier 0
+	// survives. Remaining sortable visible columns are TARGET(0),
+	// RTT(1), JITTER(5), LOSS%(6); DOWN is tier 0 too but not sortable,
+	// so it's skipped just like SPARK would be if it were still visible.
 	m.termWidth = 70
 	want := []int{0, 1, 5, 6, -1, 0}
 	for i, w := range want {
@@ -852,10 +986,10 @@ func equalSlice(a, b []string) bool {
 func TestVisibleColumns(t *testing.T) {
 	// Headers in tier order so the assertions read naturally.
 	const (
-		full    = "TARGET,RTT,MIN,AVG,MAX,JITTER,LOSS%,SENT/LOST,TTL,SPARK"
-		noMMM   = "TARGET,RTT,JITTER,LOSS%,SENT/LOST,TTL,SPARK"
-		noSent  = "TARGET,RTT,JITTER,LOSS%,SPARK"
-		noSpark = "TARGET,RTT,JITTER,LOSS%"
+		full    = "TARGET,RTT,MIN,AVG,MAX,JITTER,LOSS%,DOWN,SENT/LOST,TTL,SPARK"
+		noMMM   = "TARGET,RTT,JITTER,LOSS%,DOWN,SENT/LOST,TTL,SPARK"
+		noSent  = "TARGET,RTT,JITTER,LOSS%,DOWN,SPARK"
+		noSpark = "TARGET,RTT,JITTER,LOSS%,DOWN"
 	)
 	for _, tc := range []struct {
 		name      string
@@ -863,14 +997,14 @@ func TestVisibleColumns(t *testing.T) {
 		want      string
 	}{
 		{"unset: render all", 0, full},
-		{"exactly fits all", 126, full},
-		{"one shy of all: drop MIN/AVG/MAX", 125, noMMM},
-		{"fits without MIN/AVG/MAX", 96, noMMM},
-		{"one shy: drop SENT/LOST and TTL too", 95, noSent},
-		{"fits without SENT/LOST and TTL", 78, noSent},
-		{"one shy: drop SPARK too", 77, noSpark},
-		{"fits at minimum", 56, noSpark},
-		{"narrower than minimum: stay at 4", 30, noSpark},
+		{"exactly fits all", 134, full},
+		{"one shy of all: drop MIN/AVG/MAX", 133, noMMM},
+		{"fits without MIN/AVG/MAX", 104, noMMM},
+		{"one shy: drop SENT/LOST and TTL too", 103, noSent},
+		{"fits without SENT/LOST and TTL", 86, noSent},
+		{"one shy: drop SPARK too", 85, noSpark},
+		{"fits at minimum", 64, noSpark},
+		{"narrower than minimum: stay at 5", 30, noSpark},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx := visibleColumns(tc.termWidth)
@@ -1083,7 +1217,7 @@ func TestClearRemovesAllTargetsAndSendsStopCommands(t *testing.T) {
 	cmds := make(chan TargetCmd, 8)
 	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.stats["1.1.1.1"] = pinger.StatsUpdate{Sent: 5, Recv: 5}
-	m.history["1.1.1.1"] = []time.Duration{time.Millisecond}
+	m.history["1.1.1.1"] = []sparkSample{{rtt: time.Millisecond}}
 
 	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
 	out := mm.(Model)
@@ -1149,7 +1283,7 @@ func TestResetStatsKeepsTargetsClearsStatsAndHistory(t *testing.T) {
 	m := New([]string{"1.1.1.1", "8.8.8.8"}, updates, false, false, cmds, 256, "")
 	m.stats["1.1.1.1"] = pinger.StatsUpdate{Sent: 10, Recv: 8, RTT: 5 * time.Millisecond}
 	m.stats["8.8.8.8"] = pinger.StatsUpdate{Sent: 3, Recv: 3}
-	m.history["1.1.1.1"] = []time.Duration{time.Millisecond, 2 * time.Millisecond}
+	m.history["1.1.1.1"] = []sparkSample{{rtt: time.Millisecond}, {rtt: 2 * time.Millisecond}}
 
 	mm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	out := mm.(Model)
@@ -1229,8 +1363,8 @@ func TestToggleSparkAsciiKey(t *testing.T) {
 }
 
 func TestFormatSparkUsesASCIISetWhenToggled(t *testing.T) {
-	h := []time.Duration{1 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
-	got := formatSpark(h, sparkWidth, true)
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {rtt: 50 * time.Millisecond}, {rtt: 100 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, true, styler{})
 	runes := []rune(got)
 	last3 := runes[len(runes)-3:]
 	if last3[0] != sparkBarsASCII[0] {
@@ -1247,8 +1381,8 @@ func TestFormatSparkUsesASCIISetWhenToggled(t *testing.T) {
 }
 
 func TestFormatSparkUsesUnicodeSetByDefault(t *testing.T) {
-	h := []time.Duration{1 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
-	got := formatSpark(h, sparkWidth, false)
+	h := []sparkSample{{rtt: 1 * time.Millisecond}, {rtt: 50 * time.Millisecond}, {rtt: 100 * time.Millisecond}}
+	got := formatSpark(h, sparkWidth, false, styler{})
 	runes := []rune(got)
 	last3 := runes[len(runes)-3:]
 	if last3[2] != sparkBarsUnicode[len(sparkBarsUnicode)-1] {

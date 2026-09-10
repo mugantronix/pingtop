@@ -100,18 +100,18 @@ func TestPingerTimedOutOnUnreachableHost(t *testing.T) {
 	p := &Pinger{
 		ID:       "192.0.2.1",
 		Host:     "192.0.2.1",
-		Interval: 200 * time.Millisecond,
+		Interval: 300 * time.Millisecond,
 		Size:     24,
 		Updates:  updates,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	deadline := time.After(4500 * time.Millisecond)
+	deadline := time.After(1800 * time.Millisecond)
 	var timedOutSeen, sawFalseAfterTrue int
 	for {
 		select {
@@ -139,6 +139,74 @@ func TestPingerTimedOutOnUnreachableHost(t *testing.T) {
 			cancel()
 			<-done
 			t.Fatalf("expected at least 3 TimedOut=true updates from an unroutable host within deadline, got %d", timedOutSeen)
+		}
+	}
+}
+
+// TestPingerDownSinceAfterFiveConsecutiveFailures pings an unroutable
+// host (same TEST-NET-1 address as the TimedOut test above) and
+// confirms DownSince stays zero through the first 5 consecutive
+// failed rounds, then becomes non-zero starting with the 6th — "più
+// di 5" (more than 5) failures, matching the requirement literally.
+// Also confirms DownSince, once set, doesn't reset itself on further
+// failures (it should mark when the outage STARTED, not keep moving
+// forward).
+func TestPingerDownSinceAfterFiveConsecutiveFailures(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test; skipped in -short")
+	}
+
+	updates := make(chan StatsUpdate, 32)
+	p := &Pinger{
+		ID:       "192.0.2.1",
+		Host:     "192.0.2.1",
+		Interval: 300 * time.Millisecond,
+		Size:     24,
+		Updates:  updates,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	deadline := time.After(14 * time.Second)
+	var failedRounds int
+	var firstDownSince time.Time
+	for {
+		select {
+		case u := <-updates:
+			if !u.TimedOut {
+				continue // pre-send snapshots and any other non-outcome message
+			}
+			failedRounds++
+			switch {
+			case failedRounds <= 5:
+				if !u.DownSince.IsZero() {
+					t.Errorf("round %d: expected DownSince still zero (only %d failures so far), got %v", failedRounds, failedRounds, u.DownSince)
+				}
+			case failedRounds == 6:
+				if u.DownSince.IsZero() {
+					t.Error("round 6: expected DownSince to be set once failures exceed 5, still zero")
+				}
+				firstDownSince = u.DownSince
+			default:
+				if u.DownSince.IsZero() {
+					t.Errorf("round %d: DownSince reverted to zero while still failing", failedRounds)
+				} else if !u.DownSince.Equal(firstDownSince) {
+					t.Errorf("round %d: DownSince moved from %v to %v — should stay pinned to when the outage started", failedRounds, firstDownSince, u.DownSince)
+				}
+			}
+			if failedRounds >= 8 {
+				cancel()
+				<-done
+				return
+			}
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("only saw %d failed rounds within deadline, needed at least 8", failedRounds)
 		}
 	}
 }

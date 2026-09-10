@@ -34,7 +34,13 @@ type columnDef struct {
 // SENT/LOST and TTL are intentionally non-sortable: SENT/LOST's only
 // meaningful scalar is loss%, which the LOSS% column already covers,
 // and TTL is diagnostic metadata (route/hop info) rather than a
-// health metric worth ranking by. SPARK has no scalar either.
+// health metric worth ranking by. DOWN is also non-sortable for the
+// same reason as SENT/LOST — its only real signal (currently down or
+// not) is already visible at a glance via its own red styling, and
+// "how many seconds" isn't a ranking anyone needs mid-incident. SPARK
+// has no scalar either. DOWN sits in tier 0 (always visible, never
+// hidden by narrow terminals) since an active outage is exactly the
+// kind of thing that shouldn't disappear when the window gets small.
 var columns = []columnDef{
 	{header: "TARGET", width: 28, tier: 0, sortable: true},
 	{header: "RTT", width: 10, tier: 0, sortable: true},
@@ -43,6 +49,7 @@ var columns = []columnDef{
 	{header: "MAX", width: 10, tier: 3, sortable: true},
 	{header: "JITTER", width: 10, tier: 0, sortable: true},
 	{header: "LOSS%", width: 8, tier: 0, sortable: true},
+	{header: "DOWN", width: 8, tier: 0, sortable: false},
 	{header: "SENT/LOST", width: 12, tier: 2, sortable: false},
 	{header: "TTL", width: 6, tier: 2, sortable: false},
 	{header: "SPARK", width: sparkWidth + 2, tier: 1, sortable: false},
@@ -136,13 +143,24 @@ type updateDownloadedMsg struct {
 	err  error
 }
 
+// sparkSample is one recorded ping round in a target's SPARK history:
+// either a successful reply (rtt holds its round-trip time) or a
+// failed round (down=true, rtt meaningless/zero). Keeping both in one
+// slice element — rather than two parallel slices — keeps the ring
+// buffer append/trim logic in appendHistory simple and keeps a
+// sample's outcome and magnitude from ever drifting out of sync.
+type sparkSample struct {
+	rtt  time.Duration
+	down bool
+}
+
 // Model is the dashboard state. Construct it with New, then pass it to
 // tea.NewProgram.
 type Model struct {
 	order       []string
 	updates     <-chan pinger.StatsUpdate
 	stats       map[string]pinger.StatsUpdate
-	history     map[string][]time.Duration // per-target RTT ring buffer for the sparkline
+	history     map[string][]sparkSample // per-target ring buffer for the sparkline
 	termWidth   int                        // last WindowSizeMsg width; 0 until first event (renders all columns)
 	termHeight  int                        // last WindowSizeMsg height; 0 until first event
 	offset      int                        // first row index shown when content overflows viewport
@@ -202,7 +220,7 @@ func New(ids []string, updates <-chan pinger.StatsUpdate, keepDropped, colorize 
 		order:       ids,
 		updates:     updates,
 		stats:       make(map[string]pinger.StatsUpdate, len(ids)),
-		history:     make(map[string][]time.Duration, len(ids)),
+		history:     make(map[string][]sparkSample, len(ids)),
 		sortCol:     -1,
 		sortDesc:    true,
 		keepDropped: keepDropped,
@@ -385,6 +403,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.waitForUpdate()
 		}
+		// prev is looked up once and reused for two independent
+		// purposes below: carrying forward a stale RTT/Jitter reading
+		// across a pre-send snapshot, and detecting whether THIS
+		// message represents a genuine completed round (as opposed to
+		// that same pre-send snapshot) for the sparkline. Both checks
+		// are safe against prev being the zero value (target's first
+		// message ever, or right after a "C"/"R" reset clears the
+		// map) — a zero-value prev.Sent/prev.Recv just means "nothing
+		// recorded yet", which correctly yields "not a duplicate" and
+		// "don't carry anything forward" respectively.
+		prev := m.stats[msg.TargetID]
 		u := pinger.StatsUpdate(msg)
 		// A pre-send snapshot (emitted right before each echo goes
 		// out, to keep Sent/loss% current between replies) always
@@ -401,13 +430,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// actually stored — this carry-forward only papers over the
 		// synthetic zero in the pre-send message, it doesn't hide real
 		// fast-LAN 0ms readings.
-		if prev, ok := m.stats[msg.TargetID]; ok && u.Recv == prev.Recv && u.LastErr == nil {
+		if u.Recv == prev.Recv && u.LastErr == nil {
 			u.RTT = prev.RTT
 			u.Jitter = prev.Jitter
 		}
 		m.stats[msg.TargetID] = u
-		if msg.RTT > 0 {
-			appendHistory(m.history, msg.TargetID, msg.RTT)
+
+		// Append one sparkline sample per COMPLETED round — success or
+		// failure alike — so an outage shows up as a visible run of
+		// red bars rather than the sparkline simply pausing. A round
+		// is complete when Sent has advanced past what's already
+		// stored: the pre-send snapshot always reports Sent one below
+		// the internal counter specifically so this comparison can
+		// tell it apart from the real outcome message that follows it
+		// (see run_windows.go's preSend/snapshot split). Using Sent
+		// here rather than msg.RTT > 0 (the old check) is what makes
+		// timeouts register too, not just successful replies.
+		if msg.Sent > prev.Sent {
+			appendHistory(m.history, msg.TargetID, sparkSample{
+				rtt:  msg.RTT,
+				down: msg.TimedOut || msg.LastErr != nil,
+			})
 		}
 		return m, m.waitForUpdate()
 
@@ -586,7 +629,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.order = nil
 			m.stats = make(map[string]pinger.StatsUpdate)
-			m.history = make(map[string][]time.Duration)
+			m.history = make(map[string][]sparkSample)
 			clampOffset(&m)
 			return m, nil
 		case "t":
@@ -908,12 +951,12 @@ func (m Model) visibleIDs() []string {
 // buildRows produces table rows in the stable order. A nil stats map
 // renders all targets in their initial "no data yet" state. sparkW is
 // the rendered sparkline width (see effectiveSparkWidth).
-func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[string][]time.Duration, st styler, sparkW int, sparkAscii bool) [][]string {
+func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[string][]sparkSample, st styler, sparkW int, sparkAscii bool) [][]string {
 	rows := make([][]string, len(order))
 	for i, id := range order {
 		s, ok := stats[id]
 		if !ok {
-			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", "—", formatSpark(nil, sparkW, sparkAscii)}
+			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", "—", "—", formatSpark(nil, sparkW, sparkAscii, st)}
 			continue
 		}
 		rows[i] = []string{
@@ -924,9 +967,10 @@ func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[
 			formatDur(s.MaxRTT, s.Recv, false),
 			st.render(formatJitter(s), jitterLevel(s)),
 			st.render(formatLoss(s), lossLevel(s)),
+			st.render(formatDown(s), downLevel(s)),
 			formatSentLost(s),
 			formatTTL(s),
-			formatSpark(history[id], sparkW, sparkAscii),
+			formatSpark(history[id], sparkW, sparkAscii, st),
 		}
 	}
 	return rows
@@ -1047,6 +1091,23 @@ func formatTTL(s pinger.StatsUpdate) string {
 	return "—"
 }
 
+// formatDown reports how long a target has been continuously down
+// (more than 5 consecutive failed rounds — see DownSince's doc on
+// pinger.StatsUpdate), as a plain seconds count. Computed from
+// time.Since at render time rather than a value the pinger stamped
+// once, so the timer reads correctly between StatsUpdates rather than
+// only advancing once per ping round.
+func formatDown(s pinger.StatsUpdate) string {
+	if s.DownSince.IsZero() {
+		return "—"
+	}
+	secs := int64(time.Since(s.DownSince) / time.Second)
+	if secs < 0 {
+		secs = 0
+	}
+	return fmt.Sprintf("%ds", secs)
+}
+
 // level classifies a metric value into a color bucket. levelNeutral
 // means "no data" / "no verdict" - styler renders it without color.
 type level int
@@ -1131,6 +1192,16 @@ func lossLevel(s pinger.StatsUpdate) level {
 	default:
 		return levelCrit
 	}
+}
+
+// downLevel is binary: a target is either currently down (critical)
+// or it isn't (neutral) — there's no "warn" middle ground for an
+// outage the way there is for RTT/jitter/loss magnitude.
+func downLevel(s pinger.StatsUpdate) level {
+	if !s.DownSince.IsZero() {
+		return levelCrit
+	}
+	return levelNeutral
 }
 
 // styler wraps cell strings in lipgloss color styles. The zero value
@@ -1346,22 +1417,29 @@ var (
 	sparkBarsASCII   = []rune(".:-=+*#@")
 )
 
-func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
+func appendHistory(h map[string][]sparkSample, id string, sample sparkSample) {
 	buf := h[id]
 	if len(buf) >= maxSparkWidth {
 		buf = buf[1:]
 	}
-	h[id] = append(buf, rtt)
+	h[id] = append(buf, sample)
 }
 
-// formatSpark renders the recent RTT samples as a bar chart, scaled
-// per-target between the window's min and max so relative jitter is
-// what's visible. Pads with leading spaces until the buffer fills, so
-// the latest sample is always at the right edge. width sets the
-// rendered column width (number of bar cells). ascii selects
-// sparkBarsASCII over the Unicode default — see the "t" key toggle in
-// Update and sparkAscii's doc on Model.
-func formatSpark(history []time.Duration, width int, ascii bool) string {
+// formatSpark renders the recent ping rounds as a bar chart. Rounds
+// with a reply are scaled between the window's min and max RTT (of
+// the non-down samples only) so relative jitter is what's visible;
+// down rounds (failed — timeout or hard error) always render as the
+// tallest bar in the critical (red) style, regardless of amplitude —
+// the outage itself is the signal worth seeing, not a meaningless
+// zero RTT dragging the whole scale down. Pads with leading spaces
+// until the buffer fills, so the latest sample is always at the right
+// edge. width sets the rendered column width (number of bar cells).
+// ascii selects sparkBarsASCII over the Unicode default — see the "t"
+// key toggle in Update and sparkAscii's doc on Model. st supplies the
+// critical-red styling for down samples; an unstyled (zero-value)
+// styler renders them as plain characters, consistent with how every
+// other colored cell in the table respects the colorize flag.
+func formatSpark(history []sparkSample, width int, ascii bool, st styler) string {
 	bars := sparkBarsUnicode
 	if ascii {
 		bars = sparkBarsASCII
@@ -1375,26 +1453,41 @@ func formatSpark(history []time.Duration, width int, ascii bool) string {
 	if len(history) > width {
 		history = history[len(history)-width:]
 	}
-	min, max := history[0], history[0]
-	for _, d := range history[1:] {
-		if d < min {
-			min = d
+
+	var min, max time.Duration
+	haveRange := false
+	for _, sample := range history {
+		if sample.down {
+			continue
 		}
-		if d > max {
-			max = d
+		if !haveRange {
+			min, max = sample.rtt, sample.rtt
+			haveRange = true
+			continue
+		}
+		if sample.rtt < min {
+			min = sample.rtt
+		}
+		if sample.rtt > max {
+			max = sample.rtt
 		}
 	}
 	rng := max - min
 
 	var b strings.Builder
-	b.Grow(width * 4) // Unicode bars are up to 3-byte UTF-8 runes
+	b.Grow(width * 8) // Unicode bars are up to 3 bytes, plus room for ANSI styling on down samples
 	for i := 0; i < width-len(history); i++ {
 		b.WriteByte(' ')
 	}
-	for _, d := range history {
+	tallest := bars[len(bars)-1]
+	for _, sample := range history {
+		if sample.down {
+			b.WriteString(st.render(string(tallest), levelCrit))
+			continue
+		}
 		idx := len(bars) / 2
-		if rng > 0 {
-			idx = int(int64(d-min) * int64(len(bars)-1) / int64(rng))
+		if haveRange && rng > 0 {
+			idx = int(int64(sample.rtt-min) * int64(len(bars)-1) / int64(rng))
 			if idx < 0 {
 				idx = 0
 			}

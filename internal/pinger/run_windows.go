@@ -53,7 +53,34 @@ func (p *Pinger) Run(ctx context.Context) error {
 	var minRTT, sumRTT, maxRTT atomic.Int64
 	var lastTTL atomic.Int32
 	var lastTimedOut atomic.Bool
+	var consecutiveFails atomic.Int64
+	var downSinceNano atomic.Int64 // 0 = not currently down
 	minRTT.Store(math.MaxInt64)
+
+	// downThreshold matches the "quando falliscono più di 5 ping"
+	// requirement literally: the target enters the down state on the
+	// 6th consecutive failed round (5 fails is not yet "more than 5").
+	const downThreshold = 5
+
+	// markFailure records one failed round (timeout or hard error) and
+	// flips the target into the down state once consecutiveFails
+	// exceeds downThreshold. Idempotent about downSinceNano — it only
+	// ever sets it once per outage, never bumping it forward on
+	// subsequent failures within the same outage, so DownSince always
+	// reflects when the outage actually started.
+	markFailure := func() {
+		n := consecutiveFails.Add(1)
+		if n > downThreshold && downSinceNano.Load() == 0 {
+			downSinceNano.Store(time.Now().UnixNano())
+		}
+	}
+	// markSuccess clears both the streak and the down state the moment
+	// a single reply comes back — "se il ping ritorna a funzionare si
+	// azzera" doesn't require 5 consecutive successes, just one.
+	markSuccess := func() {
+		consecutiveFails.Store(0)
+		downSinceNano.Store(0)
+	}
 
 	snapshot := func(rtt time.Duration, lastErr error) StatsUpdate {
 		min := time.Duration(minRTT.Load())
@@ -63,6 +90,10 @@ func (p *Pinger) Run(ctx context.Context) error {
 		var avg time.Duration
 		if n := recv.Load(); n > 0 {
 			avg = time.Duration(sumRTT.Load() / n)
+		}
+		var downSince time.Time
+		if ns := downSinceNano.Load(); ns != 0 {
+			downSince = time.Unix(0, ns)
 		}
 		return StatsUpdate{
 			TargetID: p.ID,
@@ -84,8 +115,9 @@ func (p *Pinger) Run(ctx context.Context) error {
 			// row would flash red for one frame then revert to green,
 			// which is the bug this field exists to prevent. See
 			// TimedOut's doc on StatsUpdate.
-			TimedOut: lastTimedOut.Load(),
-			LastErr:  lastErr,
+			TimedOut:  lastTimedOut.Load(),
+			LastErr:   lastErr,
+			DownSince: downSince,
 		}
 	}
 
@@ -129,6 +161,7 @@ func (p *Pinger) Run(ctx context.Context) error {
 		if err != nil {
 			debugLog("icmpEcho id=%s dst=%#08x replySize=%d err=%v", p.ID, dst, int(unsafe.Sizeof(icmpEchoReply{}))+len(payload)+8, err)
 			lastTimedOut.Store(false)
+			markFailure()
 			p.emit(pCtx, snapshot(0, err))
 			continue
 		}
@@ -141,11 +174,13 @@ func (p *Pinger) Run(ctx context.Context) error {
 			// show a stale RTT as if the host just answered. See
 			// TimedOut's doc on StatsUpdate.
 			lastTimedOut.Store(true)
+			markFailure()
 			p.emit(pCtx, snapshot(0, nil))
 			continue
 		}
 
 		lastTimedOut.Store(false)
+		markSuccess()
 		lastTTL.Store(int32(ttl))
 		recv.Add(1)
 		sumRTT.Add(int64(rtt))

@@ -37,6 +37,13 @@ type StatsUpdate struct {
 	TimedOut bool
 	LastErr  error // sticky last error for display; nil on success
 	Dropped  bool  // pinger has stopped; UI should remove this target
+	// DownSince marks when this target entered a "down" state: more
+	// than 5 consecutive failed rounds (timeouts or hard errors) with
+	// no successful reply in between. The zero Time means "not
+	// currently down". A single successful reply immediately clears
+	// it back to zero, regardless of how many failures preceded it —
+	// see run_windows.go's consecutiveFails/downSinceNano handling.
+	DownSince time.Time
 }
 
 // Pinger runs a continuous ICMP echo loop against a single target and
