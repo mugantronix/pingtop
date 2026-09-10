@@ -172,33 +172,48 @@ func TestPingerDownSinceAfterFiveConsecutiveFailures(t *testing.T) {
 	go func() { done <- p.Run(ctx) }()
 
 	deadline := time.After(14 * time.Second)
-	var failedRounds int
+	// A genuine completed round is identified by Sent advancing past
+	// what was last seen — NOT by TimedOut being true. Since the
+	// pre-send snapshot at the top of each tick now carries forward
+	// the PREVIOUS round's TimedOut state (see the flicker fix on
+	// lastTimedOut), a single real failure produces two TimedOut=true
+	// messages (the pre-send echoing the prior round's state, then
+	// this round's own outcome) — counting on TimedOut alone would
+	// double-count roughly every round after the first and reach "6"
+	// while only ~3 rounds had actually completed. Sent only advances
+	// once per genuine completed round regardless of outcome (success,
+	// timeout, or hard error — see run_windows.go), so it's the
+	// reliable signal, mirroring the same technique used in
+	// internal/ui/model.go's spark-history append logic.
+	var prevSent int64
+	var genuineRounds int
 	var firstDownSince time.Time
 	for {
 		select {
 		case u := <-updates:
-			if !u.TimedOut {
-				continue // pre-send snapshots and any other non-outcome message
+			if u.Sent <= prevSent {
+				continue // pre-send snapshot, not a genuine new round
 			}
-			failedRounds++
+			prevSent = u.Sent
+			genuineRounds++
 			switch {
-			case failedRounds <= 5:
+			case genuineRounds <= 5:
 				if !u.DownSince.IsZero() {
-					t.Errorf("round %d: expected DownSince still zero (only %d failures so far), got %v", failedRounds, failedRounds, u.DownSince)
+					t.Errorf("round %d: expected DownSince still zero (only %d failures so far), got %v", genuineRounds, genuineRounds, u.DownSince)
 				}
-			case failedRounds == 6:
+			case genuineRounds == 6:
 				if u.DownSince.IsZero() {
 					t.Error("round 6: expected DownSince to be set once failures exceed 5, still zero")
 				}
 				firstDownSince = u.DownSince
 			default:
 				if u.DownSince.IsZero() {
-					t.Errorf("round %d: DownSince reverted to zero while still failing", failedRounds)
+					t.Errorf("round %d: DownSince reverted to zero while still failing", genuineRounds)
 				} else if !u.DownSince.Equal(firstDownSince) {
-					t.Errorf("round %d: DownSince moved from %v to %v — should stay pinned to when the outage started", failedRounds, firstDownSince, u.DownSince)
+					t.Errorf("round %d: DownSince moved from %v to %v — should stay pinned to when the outage started", genuineRounds, firstDownSince, u.DownSince)
 				}
 			}
-			if failedRounds >= 8 {
+			if genuineRounds >= 8 {
 				cancel()
 				<-done
 				return
@@ -206,7 +221,7 @@ func TestPingerDownSinceAfterFiveConsecutiveFailures(t *testing.T) {
 		case <-deadline:
 			cancel()
 			<-done
-			t.Fatalf("only saw %d failed rounds within deadline, needed at least 8", failedRounds)
+			t.Fatalf("only saw %d genuine rounds within deadline, needed at least 8", genuineRounds)
 		}
 	}
 }
